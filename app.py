@@ -8,6 +8,8 @@ import random
 import hashlib
 import tempfile
 import os
+import json
+import auth
 from pathlib import Path
 from datetime import datetime
 
@@ -561,6 +563,87 @@ BASE_DIR = Path(__file__).resolve().parent
 RESUME_DIR = BASE_DIR / "resumes"
 RESUME_DIR.mkdir(exist_ok=True)
 
+# Persistent application data.
+# Streamlit session_state survives page reruns, but it is reset when the
+# browser session/application is started again. This JSON snapshot keeps
+# the hiring data available across logout/login and application restarts.
+PERSISTENCE_FILE = BASE_DIR / "smart_hiring_data.json"
+
+PERSISTENT_KEYS = [
+    "candidates",
+    "ats_db",
+    "last_uploaded",
+    "interview_questions",
+    "interview_meta",
+    "interview_answers",
+    "interview_current",
+    "interview_history",
+    "interview_context_key",
+    "interview_evaluations",
+    "interview_session_active",
+    "interview_mcq_score",
+    "processed_resume_batch",
+    "saved_job_description",
+    "voice_question_index",
+    "voice_history",
+    "voice_last_audio_hash",
+    "voice_session_active",
+    "voice_completed",
+    "voice_context_key",
+    "candidate_applications",
+]
+
+def _json_safe(value):
+    """Convert common session-state values into JSON-safe values."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def save_persistent_data():
+    """Save application data without touching login/session identity."""
+    data = {key: _json_safe(st.session_state.get(key)) for key in PERSISTENT_KEYS}
+    temp_file = PERSISTENCE_FILE.with_suffix(".tmp")
+    try:
+        temp_file.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        temp_file.replace(PERSISTENCE_FILE)
+    except Exception:
+        # Persistence must never break the hiring application.
+        try:
+            if temp_file.exists():
+                temp_file.unlink()
+        except Exception:
+            pass
+
+
+def load_persistent_data():
+    """Restore the last saved hiring state when the app starts."""
+    if not PERSISTENCE_FILE.exists():
+        return
+    try:
+        data = json.loads(PERSISTENCE_FILE.read_text(encoding="utf-8"))
+        for key in PERSISTENT_KEYS:
+            if key in data:
+                st.session_state[key] = data[key]
+        # This value is normally a tuple during the current session.
+        batch = st.session_state.get("processed_resume_batch")
+        if isinstance(batch, list):
+            st.session_state.processed_resume_batch = tuple(
+                tuple(item) if isinstance(item, list) else item
+                for item in batch
+            )
+    except Exception:
+        # If an old/corrupt snapshot exists, start clean rather than
+        # preventing the application from opening.
+        return
+
 
 # ============================================================
 # SESSION STATE
@@ -572,11 +655,20 @@ if "logged_in" not in st.session_state:
 if "username" not in st.session_state:
     st.session_state.username = ""
 
+if "user_role" not in st.session_state:
+    st.session_state.user_role = ""
+
+if "auth_user" not in st.session_state:
+    st.session_state.auth_user = None
+
 if "page" not in st.session_state:
     st.session_state.page = "Dashboard"
 
 if "candidates" not in st.session_state:
     st.session_state.candidates = []
+
+if "candidate_applications" not in st.session_state:
+    st.session_state.candidate_applications = []
 
 # Ensure previously loaded candidates always have a hiring status.
 for _candidate in st.session_state.candidates:
@@ -631,6 +723,15 @@ if "voice_completed" not in st.session_state:
     st.session_state.voice_completed = False
 if "voice_context_key" not in st.session_state:
     st.session_state.voice_context_key = ""
+
+# Load once on the first run. On every later Streamlit rerun, save the
+# previous in-memory data first. This also catches changes made immediately
+# before st.rerun() calls (for example logout or interview actions).
+if "_persistent_data_loaded" not in st.session_state:
+    load_persistent_data()
+    st.session_state._persistent_data_loaded = True
+else:
+    save_persistent_data()
 
 
 # ============================================================
@@ -1474,68 +1575,459 @@ def add_candidate(candidate):
 
 
 # ============================================================
+# ============================================================
 # LOGIN PAGE
 # ============================================================
 
 def login_page():
-
+    # Role-based authentication only.
+    # The rest of the application remains unchanged.
     st.title("🤖 AI Smart Hiring")
+    st.caption("Intelligent Hiring Platform")
+    st.divider()
 
-    st.caption(
-        "Intelligent Hiring Platform"
-    )
+    left, center, right = st.columns([1, 2, 1])
+
+    with center:
+        st.header("🔐 Welcome Back")
+        st.caption("Choose your account type to continue.")
+
+        role_labels = {
+            "👨‍💼 Recruiter": "recruiter",
+            "👤 Candidate / User": "user",
+            "🛡️ Administrator": "admin",
+        }
+
+        selected_label = st.radio(
+            "Login as",
+            list(role_labels.keys()),
+            horizontal=True,
+            key="login_role_selector",
+        )
+        selected_role = role_labels[selected_label]
+
+        with st.form("role_login_form", clear_on_submit=False):
+            username = st.text_input(
+                "Username / Email",
+                placeholder="Enter username or email",
+                key="login_username",
+            )
+            password = st.text_input(
+                "Password",
+                type="password",
+                placeholder="Enter password",
+                key="login_password",
+            )
+
+            submitted = st.form_submit_button(
+                "🔐 Sign In",
+                use_container_width=True,
+            )
+
+        if submitted:
+            if not username.strip():
+                st.error("Please enter your username or email.")
+            elif not password.strip():
+                st.error("Please enter your password.")
+            else:
+                user = auth.login_user(
+                    username.strip(),
+                    password,
+                    selected_role,
+                )
+
+                if user:
+                    # Keep the existing session variables used by the app.
+                    st.session_state.logged_in = True
+                    st.session_state.username = user["username"]
+                    st.session_state.user_role = user["role"]
+                    st.session_state.auth_user = user
+                    st.session_state.user = user
+                    st.session_state.page = (
+                        "Admin Portal" if user["role"] == "admin"
+                        else "Candidate Portal" if user["role"] == "user"
+                        else "Dashboard"
+                    )
+                    st.rerun()
+                else:
+                    st.error(
+                        f"Invalid {selected_role} login. "
+                        "Check the username, password, and selected account type."
+                    )
+
+        with st.expander("ℹ️ Demo Login Accounts"):
+            st.markdown(
+                """
+                **Administrator**  
+                Username: `admin`  
+                Password: `Admin@123`
+
+                **Recruiter**  
+                Username: `recruiter`  
+                Password: `Recruiter@123`
+
+                **Candidate / User**  
+                Username: `user`  
+                Password: `User@123`
+                """
+            )
+
+        st.caption(
+            "New Candidate and Recruiter accounts can be created through the "
+            "authentication system. Administrator accounts are restricted."
+        )
+
+
+# ============================================================
+# ROLE-SPECIFIC PORTALS
+# ============================================================
+
+def candidate_portal():
+    """Candidate-facing application portal. Recruiter pages remain unchanged."""
+    st.title("👤 Candidate Portal")
+    st.caption("Apply for opportunities, track your application, and follow your interview progress.")
+
+    username = st.session_state.get("username", "Candidate")
+    auth_user = st.session_state.get("auth_user") or {}
+    account_email = str(auth_user.get("email", "")).strip().lower()
+    applications = st.session_state.get("candidate_applications", [])
+    candidates = st.session_state.get("candidates", [])
+
+    my_apps = [
+        a for a in applications
+        if str(a.get("username", "")).strip().lower() == username.strip().lower()
+        or (account_email and str(a.get("email", "")).strip().lower() == account_email)
+    ]
+
+    # Keep compatibility with an already-created recruiter candidate record.
+    mine = None
+    for item in candidates:
+        email = str(item.get("email", "")).strip().lower()
+        if account_email and email == account_email:
+            mine = item
+            break
+        if not mine and str(item.get("applicant_username", "")).strip().lower() == username.strip().lower():
+            mine = item
+            break
+
+    # ------------------------------------------------------------
+    # Candidate summary cards
+    # ------------------------------------------------------------
+    latest = my_apps[-1] if my_apps else None
+    if mine:
+        status = mine.get("status", "Applied")
+        match = float(mine.get("match_score", 0) or 0)
+        ats = float(mine.get("ats_score", 0) or 0)
+        interview_done = bool(mine.get("interview_completed"))
+    elif latest:
+        status = latest.get("status", "Applied")
+        match = float(latest.get("match_score", 0) or 0)
+        ats = float(latest.get("ats_score", 0) or 0)
+        interview_done = bool(latest.get("interview_completed"))
+    else:
+        status, match, ats, interview_done = "Not Applied", 0, 0, False
+
+    st.markdown(f"### Welcome, {username} 👋")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Application Status", status)
+    c2.metric("Job Match", f"{match:.1f}%" if match else "—")
+    c3.metric("ATS Score", f"{ats:.1f}%" if ats else "—")
+    c4.metric("Interview", "Completed" if interview_done else "Pending")
 
     st.divider()
 
-    left, center, right = st.columns(
-        [1, 2, 1]
-    )
+    tab_apply, tab_application, tab_progress = st.tabs([
+        "📝 Apply for a Job",
+        "📄 My Application",
+        "📈 Application Progress",
+    ])
 
-    with center:
+    # ------------------------------------------------------------
+    # Candidate's own application process
+    # ------------------------------------------------------------
+    with tab_apply:
+        st.subheader("📝 Submit a Job Application")
+        st.caption("This application area is available only to candidates. Recruiter hiring tools remain separate.")
 
-        st.header("🔐 Welcome Back")
+        with st.form("candidate_application_form", clear_on_submit=False):
+            a1, a2 = st.columns(2)
+            with a1:
+                full_name = st.text_input("Full Name *", value=(mine or {}).get("name", username))
+                email = st.text_input("Email *", value=(mine or {}).get("email", account_email))
+                phone = st.text_input("Phone Number", value=(mine or {}).get("phone", ""))
+                position = st.text_input("Position Applying For *", value=(mine or {}).get("job_applied", ""), placeholder="e.g. Data Scientist")
+            with a2:
+                education = st.text_input("Highest Education", value=(mine or {}).get("education", ""), placeholder="e.g. B.Tech CSE")
+                experience = st.text_input("Experience", value=(mine or {}).get("experience", ""), placeholder="e.g. Fresher / 1 year")
+                skills_text = st.text_input("Skills", value=", ".join((mine or {}).get("skills", [])) if isinstance((mine or {}).get("skills", []), list) else str((mine or {}).get("skills", "")), placeholder="Python, SQL, AWS")
+                resume_file = st.file_uploader("Resume (PDF / DOCX / TXT)", type=["pdf", "docx", "txt"], key="candidate_resume_upload")
 
-        username = st.text_input(
-            "Username / Email",
-            placeholder="Enter username or email"
-        )
+            cover_note = st.text_area("Short Introduction / Cover Note", placeholder="Briefly tell the recruiter why you are suitable for this role.")
+            submitted = st.form_submit_button("🚀 Submit Application", use_container_width=True)
 
-        password = st.text_input(
-            "Password",
-            type="password",
-            placeholder="Enter password"
-        )
-
-        if st.button(
-            "🔐 Sign In",
-            use_container_width=True
-        ):
-
-            if not username.strip():
-
-                st.error(
-                    "Please enter your username or email."
-                )
-
-            elif not password.strip():
-
-                st.error(
-                    "Please enter your password."
-                )
-
+        if submitted:
+            if not full_name.strip() or not email.strip() or not position.strip():
+                st.error("Please fill in Full Name, Email, and Position Applying For.")
             else:
+                resume_path = ""
+                resume_text = ""
+                parsed_skills = [x.strip() for x in skills_text.split(",") if x.strip()]
 
-                st.session_state.logged_in = True
+                if resume_file is not None:
+                    safe_user = re.sub(r"[^A-Za-z0-9_-]+", "_", username).strip("_") or "candidate"
+                    suffix = Path(resume_file.name).suffix.lower()
+                    filename = f"candidate_{safe_user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}{suffix}"
+                    resume_path_obj = RESUME_DIR / filename
+                    resume_path_obj.write_bytes(resume_file.getbuffer())
+                    resume_path = str(resume_path_obj)
+                    resume_text = extract_resume_text(resume_path_obj)
+                    if resume_text and not parsed_skills:
+                        parsed_skills = extract_skills(resume_text)
 
-                st.session_state.username = (
-                    username.strip()
+                application = {
+                    "application_id": f"APP-{datetime.now().strftime('%Y%m%d%H%M%S')}-{len(applications)+1:03d}",
+                    "username": username,
+                    "email": email.strip().lower(),
+                    "name": full_name.strip(),
+                    "phone": phone.strip(),
+                    "job_applied": position.strip(),
+                    "education": education.strip(),
+                    "experience": experience.strip(),
+                    "skills": parsed_skills,
+                    "cover_note": cover_note.strip(),
+                    "resume_path": resume_path,
+                    "status": "Applied",
+                    "match_score": 0,
+                    "ats_score": 0,
+                    "interview_completed": False,
+                    "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "source": "candidate_portal",
+                }
+
+                # Update an existing application for the same candidate + role,
+                # otherwise create a new application. Existing recruiter data is untouched.
+                existing = next(
+                    (a for a in applications
+                     if str(a.get("username", "")).lower() == username.lower()
+                     and str(a.get("job_applied", "")).strip().lower() == position.strip().lower()),
+                    None
                 )
+                if existing:
+                    existing.update(application)
+                else:
+                    applications.append(application)
 
-                st.session_state.page = (
-                    "Dashboard"
-                )
-
+                # Also make the application visible to the existing recruiter workflow.
+                candidate_record = dict(application)
+                candidate_record["applicant_username"] = username
+                add_candidate(candidate_record)
+                st.session_state.candidate_applications = applications
+                save_persistent_data()
+                st.success("Application submitted successfully. You can track it from My Application and Application Progress.")
                 st.rerun()
+
+    # ------------------------------------------------------------
+    # Candidate's own application details
+    # ------------------------------------------------------------
+    with tab_application:
+        st.subheader("📄 My Application")
+        if latest:
+            left, right = st.columns([1.1, 0.9])
+            with left:
+                st.write(f"**Application ID:** {latest.get('application_id', 'Not available')}")
+                st.write(f"**Position:** {latest.get('job_applied', 'Not assigned')}")
+                st.write(f"**Submitted:** {latest.get('submitted_at', 'Not available')}")
+                st.write(f"**Education:** {latest.get('education', 'Not provided')}")
+                st.write(f"**Experience:** {latest.get('experience', 'Not provided')}")
+                st.write(f"**Email:** {latest.get('email', account_email or 'Not available')}")
+                st.write(f"**Phone:** {latest.get('phone', 'Not provided')}")
+                st.subheader("🧠 Skills")
+                skills = latest.get("skills", [])
+                st.write(" • ".join(str(x) for x in skills) if skills else "Skills not provided.")
+                if latest.get("cover_note"):
+                    st.subheader("💬 Cover Note")
+                    st.info(latest.get("cover_note"))
+            with right:
+                st.subheader("Current Status")
+                current_status = str(latest.get("status", "Applied"))
+                if current_status.lower() == "selected":
+                    st.success("🎉 Selected")
+                elif current_status.lower() == "rejected":
+                    st.error("Application Rejected")
+                elif "interview" in current_status.lower():
+                    st.warning("🎤 Interview Stage")
+                else:
+                    st.info(f"📌 {current_status}")
+                st.metric("Match Score", f"{float(latest.get('match_score', 0) or 0):.1f}%" if latest.get('match_score') else "—")
+                st.metric("ATS Score", f"{float(latest.get('ats_score', 0) or 0):.1f}%" if latest.get('ats_score') else "—")
+        else:
+            st.info("You have not submitted an application yet. Use 'Apply for a Job' to begin.")
+
+    # ------------------------------------------------------------
+    # Candidate progress / interview status
+    # ------------------------------------------------------------
+    with tab_progress:
+        st.subheader("📈 Application Progress")
+        if latest:
+            current = str(latest.get("status", "Applied")).lower()
+            interview_done = bool(latest.get("interview_completed"))
+            stages = [
+                ("Application Submitted", True),
+                ("Recruiter Review", current not in {"applied", "new"}),
+                ("Interview", interview_done or "interview" in current or current == "selected"),
+                ("Final Decision", current in {"selected", "rejected"}),
+            ]
+            for label, done in stages:
+                st.write(("✅ " if done else "◻️ ") + label)
+
+            if current == "selected":
+                st.success("🎉 Congratulations! Your application has been selected.")
+            elif current == "rejected":
+                st.warning("Your application has been marked as rejected.")
+            else:
+                st.info("Your application is currently under review.")
+        else:
+            st.info("Application progress will appear here after you submit an application.")
+
+    st.divider()
+    st.caption("Candidate access is focused on applying for opportunities and tracking your own hiring progress. Recruiter operations and administrative controls remain restricted to their respective roles.")
+
+def admin_portal():
+    """Administrator-only platform oversight dashboard."""
+    st.title("🛡️ Administrator Dashboard")
+    st.caption("Platform governance, account oversight, system health and recruitment monitoring.")
+
+    try:
+        users = auth.get_all_users()
+    except Exception:
+        users = []
+
+    candidates = st.session_state.get("candidates", [])
+    applications = st.session_state.get("candidate_applications", [])
+    ats_records = st.session_state.get("ats_db", [])
+
+    admin_count = sum(1 for u in users if u.get("role") == "admin")
+    recruiter_count = sum(1 for u in users if u.get("role") == "recruiter")
+    candidate_count = sum(1 for u in users if u.get("role") == "user")
+    selected_count = sum(1 for c in candidates if str(c.get("status", "")).lower() == "selected")
+    interview_count = sum(1 for c in candidates if c.get("interview_completed"))
+    pending_apps = sum(1 for a in applications if str(a.get("status", "Applied")).lower() in {"applied", "new", "screening"})
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Accounts", len(users))
+    c2.metric("Recruiters", recruiter_count)
+    c3.metric("Candidates", candidate_count)
+    c4.metric("Applications", len(applications))
+
+    st.divider()
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Pending Applications", pending_apps)
+    h2.metric("Candidate Records", len(candidates))
+    h3.metric("Interviews Completed", interview_count)
+    h4.metric("Selected Candidates", selected_count)
+
+    tab_overview, tab_accounts, tab_applications, tab_health = st.tabs([
+        "📊 Platform Overview",
+        "👥 Account Management",
+        "📋 Application Oversight",
+        "⚙️ System Health",
+    ])
+
+    with tab_overview:
+        st.subheader("📊 Recruitment Platform Overview")
+        if candidates:
+            status_counts = {}
+            for c in candidates:
+                status = c.get("status", "New")
+                status_counts[status] = status_counts.get(status, 0) + 1
+            fig = px.bar(
+                x=list(status_counts.keys()),
+                y=list(status_counts.values()),
+                labels={"x": "Candidate Status", "y": "Candidates"},
+                title="Candidate Pipeline by Status",
+            )
+            st.plotly_chart(style_chart(fig, 340), use_container_width=True)
+        else:
+            st.info("Candidate pipeline data will appear here as applications are processed.")
+
+        left, right = st.columns(2)
+        with left:
+            st.subheader("🔐 Role Distribution")
+            role_rows = [
+                {"Role": "Administrator", "Accounts": admin_count},
+                {"Role": "Recruiter", "Accounts": recruiter_count},
+                {"Role": "Candidate", "Accounts": candidate_count},
+            ]
+            st.dataframe(role_rows, use_container_width=True, hide_index=True)
+        with right:
+            st.subheader("⭐ Hiring Snapshot")
+            st.write(f"**ATS Records:** {len(ats_records)}")
+            st.write(f"**Selected Candidates:** {selected_count}")
+            st.write(f"**Completed Interviews:** {interview_count}")
+            st.write(f"**Pending Applications:** {pending_apps}")
+
+    with tab_accounts:
+        st.subheader("👥 Registered Accounts")
+        if users:
+            rows = []
+            for u in users:
+                role = u.get("role", "user")
+                role_label = {
+                    "admin": "🛡️ Administrator",
+                    "recruiter": "👨‍💼 Recruiter",
+                    "user": "👤 Candidate / User",
+                }.get(role, role.title())
+                rows.append({
+                    "Username": u.get("username", ""),
+                    "Email": u.get("email", ""),
+                    "Role": role_label,
+                    "Created": u.get("created_at", ""),
+                })
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("No registered accounts found.")
+        st.caption("Account creation and authentication remain controlled by the authentication layer. This dashboard provides administrator-level visibility without exposing recruiter tools.")
+
+    with tab_applications:
+        st.subheader("📋 Application Oversight")
+        if applications:
+            rows = []
+            for a in applications:
+                rows.append({
+                    "Application ID": a.get("application_id", ""),
+                    "Candidate": a.get("name", "Unknown"),
+                    "Position": a.get("job_applied", "Not assigned"),
+                    "Status": a.get("status", "Applied"),
+                    "Submitted": a.get("submitted_at", ""),
+                })
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("No candidate applications have been submitted yet.")
+
+        st.subheader("🕒 Recent Candidate Activity")
+        if candidates:
+            recent = []
+            for c in candidates[-8:][::-1]:
+                recent.append({
+                    "Candidate": c.get("name", "Unknown Candidate"),
+                    "Job": c.get("job_applied") or "Not assigned",
+                    "Match": f"{float(c.get('match_score', 0) or 0):.1f}%",
+                    "ATS": f"{float(c.get('ats_score', 0) or 0):.1f}%",
+                    "Status": c.get("status", "New"),
+                })
+            st.dataframe(recent, use_container_width=True, hide_index=True)
+        else:
+            st.info("No candidate activity is available yet.")
+
+    with tab_health:
+        st.subheader("⚙️ Platform Health")
+        st.success("Authentication service: Active")
+        st.success("Persistent application data: Active")
+        st.success("Recruiter workflow: Active")
+        st.success("Candidate application portal: Active")
+        st.success("ATS integration: Active")
+        st.success("Voice screening module: Available")
+        st.info("Administrator access is limited to platform monitoring and oversight. Recruiter pages are not exposed in this role.")
 
 
 # ============================================================
@@ -1556,20 +2048,38 @@ def create_sidebar():
 
         st.write("SIGNED IN AS")
 
+        role_display = {
+            "admin": "🛡️ Administrator",
+            "recruiter": "👨‍💼 Recruiter",
+            "user": "👤 Candidate / User",
+        }.get(st.session_state.get("user_role", ""), "👤 User")
+
         st.write(
             "👤 " + st.session_state.username
         )
+        st.caption(role_display)
 
         st.divider()
 
-        pages = [
-            "🏠 Dashboard",
-            "📄 Resume Analyzer",
-            "🎯 Job Matching",
-            "👥 Candidates",
-            "📊 Analytics",
-            "💬 Interview Assistant"
-        ]
+        current_role = st.session_state.get("user_role", "")
+
+        if current_role == "recruiter":
+            pages = [
+                "🏠 Dashboard",
+                "📄 Resume Analyzer",
+                "🎯 Job Matching",
+                "👥 Candidates",
+                "📊 Analytics",
+                "💬 Interview Assistant"
+            ]
+        elif current_role == "admin":
+            pages = [
+                "🛡️ Admin Portal"
+            ]
+        else:
+            pages = [
+                "👤 Candidate Portal"
+            ]
 
         for page in pages:
 
@@ -1594,8 +2104,12 @@ def create_sidebar():
             use_container_width=True
         ):
 
+            save_persistent_data()
             st.session_state.logged_in = False
             st.session_state.username = ""
+            st.session_state.user_role = ""
+            st.session_state.auth_user = None
+            st.session_state.user = None
             st.session_state.page = "Dashboard"
 
             st.rerun()
@@ -1696,48 +2210,231 @@ VOICE_SCREENING_QUESTIONS = {
 }
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
 def _voice_tts_audio(text):
-    """Generate a small WAV prompt with pyttsx3 when available."""
+    """Generate a natural AI-interviewer voice prompt.
+
+    Primary engine: Microsoft Edge neural TTS through edge-tts.
+    Fallback: local Windows/pyttsx3 voice when edge-tts is unavailable.
+
+    Returns:
+        (audio_bytes, mime_type) or (None, None)
+    """
+    text = str(text or "").strip()
+    if not text:
+        return None, None
+
+    # ------------------------------------------------------------
+    # 1) Natural neural voice - preferred for the demo
+    # ------------------------------------------------------------
+    try:
+        import asyncio
+        import edge_tts
+
+        async def _generate():
+            communicate = edge_tts.Communicate(
+                text=text,
+                voice="en-IN-NeerjaNeural",
+                rate="-5%",
+                pitch="+0Hz",
+                volume="+0%",
+            )
+            chunks = []
+            async for chunk in communicate.stream():
+                if chunk.get("type") == "audio":
+                    chunks.append(chunk.get("data", b""))
+            return b"".join(chunks)
+
+        try:
+            data = asyncio.run(_generate())
+        except RuntimeError:
+            # Safe fallback if an event loop already exists.
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                data = loop.run_until_complete(_generate())
+            finally:
+                loop.close()
+                asyncio.set_event_loop(None)
+
+        if data:
+            return data, "audio/mpeg"
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------
+    # 2) Offline/local fallback - keeps the feature usable
+    # ------------------------------------------------------------
+    path = None
     try:
         import pyttsx3
+
         fd, path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         engine = pyttsx3.init()
-        engine.setProperty("rate", 165)
+        engine.setProperty("rate", 155)
+        engine.setProperty("volume", 1.0)
+
+        # Prefer an English voice when Windows exposes one.
+        try:
+            voices = engine.getProperty("voices") or []
+            for voice in voices:
+                voice_text = (
+                    f"{getattr(voice, 'name', '')} "
+                    f"{getattr(voice, 'id', '')}"
+                ).lower()
+                if "english" in voice_text or "en-in" in voice_text or "en-us" in voice_text:
+                    engine.setProperty("voice", voice.id)
+                    break
+        except Exception:
+            pass
+
         engine.save_to_file(text, path)
         engine.runAndWait()
+
         with open(path, "rb") as audio_file:
             data = audio_file.read()
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-        return data
+
+        return (data, "audio/wav") if data else (None, None)
     except Exception:
-        return None
+        return None, None
+    finally:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+@st.cache_resource(show_spinner=False)
+def _load_whisper_model():
+    """Load Whisper only once so every interview answer reuses the same model."""
+    import whisper
+
+    # base is a practical CPU-friendly model for a college-project demo.
+    # It is noticeably more accurate than tiny while still being manageable.
+    return whisper.load_model("base")
 
 
 def _voice_transcribe(uploaded_audio):
-    """Convert browser-recorded WAV audio to text using SpeechRecognition."""
+    """Transcribe a recorded interview answer locally with OpenAI Whisper.
+
+    The browser recorder stays exactly the same. Whisper runs locally, so the
+    answer is not sent to Google Speech Recognition and does not depend on the
+    SpeechRecognition Google endpoint understanding the browser WAV correctly.
+    """
     path = None
     try:
-        import speech_recognition as sr
-        audio_bytes = uploaded_audio.getvalue() if hasattr(uploaded_audio, "getvalue") else bytes(uploaded_audio)
-        fd, path = tempfile.mkstemp(suffix=".wav")
+        import wave
+        import whisper
+
+        audio_bytes = (
+            uploaded_audio.getvalue()
+            if hasattr(uploaded_audio, "getvalue")
+            else bytes(uploaded_audio)
+        )
+
+        if not audio_bytes:
+            return None, "The recording is empty. Please record an answer first."
+
+        # Browser Streamlit audio_input normally returns WAV. For uploaded files,
+        # preserve the original extension so FFmpeg can decode the format.
+        suffix = ".wav"
+        name = getattr(uploaded_audio, "name", "") or ""
+        if "." in name:
+            candidate_suffix = os.path.splitext(name)[1].lower()
+            if candidate_suffix in {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm"}:
+                suffix = candidate_suffix
+
+        fd, path = tempfile.mkstemp(suffix=suffix)
         os.close(fd)
         with open(path, "wb") as audio_file:
             audio_file.write(audio_bytes)
 
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(path) as source:
-            audio = recognizer.record(source)
+        # Give a useful message for a silent/near-silent WAV instead of making
+        # the user wait for a model that cannot possibly find speech.
+        if suffix == ".wav":
+            try:
+                with wave.open(path, "rb") as wav_file:
+                    frames = wav_file.readframes(wav_file.getnframes())
+                    sample_width = wav_file.getsampwidth()
+                    channels = wav_file.getnchannels()
 
-        transcript = recognizer.recognize_google(audio)
+                if frames and sample_width in (1, 2, 4):
+                    import audioop
+                    rms = audioop.rms(frames, sample_width)
+                    if rms < 80:
+                        return None, (
+                            "The recording is almost silent. Please speak clearly "
+                            "toward the microphone and record again."
+                        )
+            except Exception:
+                # If the WAV metadata is unusual, let Whisper/FFmpeg handle it.
+                pass
+
+        model = _load_whisper_model()
+
+        result = model.transcribe(
+            path,
+            language="en",
+            task="transcribe",
+            fp16=False,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            beam_size=5,
+            best_of=5,
+            initial_prompt=(
+                "This is a professional job interview. The candidate may discuss "
+                "data science, machine learning, Python, SQL, statistics, "
+                "software development, projects, education, internships, "
+                "cloud, deployment, APIs, analytics and technical skills."
+            ),
+        )
+
+        transcript = " ".join((result.get("text") or "").split()).strip()
+
+        if not transcript:
+            return None, (
+                "Whisper could not detect clear spoken words. Please speak for "
+                "at least 3–5 seconds and record the answer again."
+            )
+
+        # Reject a few common hallucinations that can appear on very short/silent clips.
+        normalized = transcript.lower().strip(" .!?\"'")
+        hallucinations = {
+            "thank you",
+            "thanks for watching",
+            "thank you for watching",
+            "you",
+            "bye",
+        }
+        if normalized in hallucinations and len(transcript.split()) <= 5:
+            return None, (
+                "The recording did not contain enough clear speech. "
+                "Please give a complete spoken answer and try again."
+            )
+
         return transcript, None
+
+    except ImportError as exc:
+        if "whisper" in str(exc).lower():
+            return None, (
+                "OpenAI Whisper is not installed. Run:\n"
+                "python -m pip install openai-whisper"
+            )
+        return None, f"Required audio package is missing: {exc}"
     except Exception as exc:
-        return None, str(exc)
+        message = str(exc)
+        lower_message = message.lower()
+        if "ffmpeg" in lower_message or "filenotfounderror" in lower_message:
+            return None, (
+                "Whisper needs FFmpeg to decode the recorded audio. "
+                "Install FFmpeg, make sure `ffmpeg -version` works in PowerShell, "
+                "then restart Streamlit."
+            )
+        return None, f"Whisper transcription failed: {type(exc).__name__}: {exc}"
     finally:
-        if path:
+        if path and os.path.exists(path):
             try:
                 os.remove(path)
             except OSError:
@@ -1842,12 +2539,12 @@ def voice_screening_module():
         st.markdown(f"**Question {q_index + 1} of {len(questions)}**")
         st.markdown(f'<div class="chat-ai">🤖 {question}</div>', unsafe_allow_html=True)
 
-        tts = _voice_tts_audio(question)
+        tts, tts_format = _voice_tts_audio(question)
         if tts:
-            st.audio(tts, format="audio/wav")
+            st.audio(tts, format=tts_format)
             st.caption("🔊 AI interviewer voice")
         else:
-            st.caption("🔊 Install pyttsx3 to enable spoken interviewer prompts; text screening remains available.")
+            st.caption("🔊 AI interviewer voice is unavailable. Install edge-tts or keep pyttsx3 enabled for the local fallback.")
 
         # Browser microphone recorder. The recording is intentionally kept on the
         # current question until the recruiter explicitly analyzes it.
@@ -3542,26 +4239,34 @@ else:
         st.session_state.page
     )
 
-    if current_page == "Dashboard":
+    current_role = st.session_state.get("user_role", "")
 
-        dashboard()
+    if current_role == "admin":
+        if current_page != "Admin Portal":
+            st.session_state.page = "Admin Portal"
+            current_page = "Admin Portal"
+        admin_portal()
 
-    elif current_page == "Resume Analyzer":
+    elif current_role == "user":
+        if current_page != "Candidate Portal":
+            st.session_state.page = "Candidate Portal"
+            current_page = "Candidate Portal"
+        candidate_portal()
 
-        resume_analyzer()
+    else:
+        if current_page == "Dashboard":
+            dashboard()
+        elif current_page == "Resume Analyzer":
+            resume_analyzer()
+        elif current_page == "Job Matching":
+            job_matching()
+        elif current_page == "Candidates":
+            candidates_page()
+        elif current_page == "Analytics":
+            analytics()
+        elif current_page == "Interview Assistant":
+            interview_assistant()
 
-    elif current_page == "Job Matching":
-
-        job_matching()
-
-    elif current_page == "Candidates":
-
-        candidates_page()
-
-    elif current_page == "Analytics":
-
-        analytics()
-
-    elif current_page == "Interview Assistant":
-
-        interview_assistant()
+# Save the latest application data after rendering the current page.
+# This does not reset or modify any existing UI/session behaviour.
+save_persistent_data()

@@ -11,6 +11,7 @@ __pycache__/
 
 # Uploaded resumes / generated data
 resumes/*
+smart_hiring_data.json
 *.db
 *.sqlite
 *.sqlite3
@@ -25,3 +26,4 @@ resumes/*
 # OS
 .DS_Store
 Thumbs.db
+auth_users.db
